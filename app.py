@@ -34,7 +34,8 @@ def custom_kmeans(data, k, max_iters=100):
     for _ in range(max_iters):
         clusters = assign_to_clusters(data, centroids)
         new_centroids = update_centroids(data, clusters, k)
-        if np.all(centroids == new_centroids):
+        # safer stopping condition
+        if np.allclose(centroids, new_centroids, atol=1e-6):
             break
         centroids = new_centroids
     return clusters, centroids
@@ -44,7 +45,8 @@ def load_initial_data(file_obj):
     if file_obj is None:
         return None, "Please upload a file first.", None
 
-    df = pd.read_csv(file_obj.name, encoding='ISO-8859-1')
+    # safer file read
+    df = pd.read_csv(file_obj, encoding='ISO-8859-1')
     initial_rows = len(df)
     df.dropna(axis=0, subset=['CustomerID'], inplace=True)
     df = df[df['Quantity'] > 0]
@@ -54,11 +56,11 @@ def load_initial_data(file_obj):
     df['TotalPrice'] = df['Quantity'] * df['UnitPrice']
     rows_after_clean = len(df)
     rows_removed = initial_rows - rows_after_clean
-    status = f"Loaded '{file_obj.name}'. Removed {rows_removed} invalid rows. Current Shape: {df.shape}"
+    status = f"Loaded file. Removed {rows_removed} invalid rows. Current Shape: {df.shape}"
     return df, status, df
 
-# --- ELBOW PLOT ---
-def compute_elbow(df):
+# --- ELBOW PLOT + EXTRA EDA ---
+def compute_elbow_and_eda(df):
     snapshot_date = df['InvoiceDate'].max() + dt.timedelta(days=1)
     rfm_df = df.groupby('CustomerID').agg({
         'InvoiceDate': lambda date: (snapshot_date - date.max()).days,
@@ -66,10 +68,29 @@ def compute_elbow(df):
         'TotalPrice': 'sum'
     }).rename(columns={'InvoiceDate':'Recency','InvoiceNo':'Frequency','TotalPrice':'MonetaryValue'})
 
+    # --- Histograms ---
+    fig_hist, axes = plt.subplots(1, 3, figsize=(15, 4))
+    rfm_df['Recency'].plot(kind='hist', bins=30, ax=axes[0], color='skyblue', edgecolor='black')
+    axes[0].set_title("Recency Distribution")
+    rfm_df['Frequency'].plot(kind='hist', bins=30, ax=axes[1], color='lightgreen', edgecolor='black')
+    axes[1].set_title("Frequency Distribution")
+    rfm_df['MonetaryValue'].plot(kind='hist', bins=30, ax=axes[2], color='salmon', edgecolor='black')
+    axes[2].set_title("Monetary Value Distribution")
+    plt.tight_layout()
+    plt.close(fig_hist)
+
+    # --- Correlation Heatmap ---
+    fig_corr, ax_corr = plt.subplots(figsize=(6,5))
+    sns.heatmap(rfm_df[['Recency','Frequency','MonetaryValue']].corr(), annot=True, cmap="coolwarm", ax=ax_corr)
+    ax_corr.set_title("Correlation Heatmap")
+    plt.close(fig_corr)
+
+    # --- Log transform + Scaling ---
     rfm_log = np.log1p(rfm_df[['Recency','Frequency','MonetaryValue']])
     scaler = StandardScaler()
     rfm_scaled = scaler.fit_transform(rfm_log)
 
+    # --- Elbow Plot ---
     inertia, k_range = [], range(2, 11)
     for k in k_range:
         clusters, centroids = custom_kmeans(rfm_scaled, k)
@@ -84,7 +105,7 @@ def compute_elbow(df):
     ax_elbow.grid(True)
     plt.close(fig_elbow)
     
-    return fig_elbow, rfm_scaled, rfm_df
+    return fig_elbow, fig_hist, fig_corr, rfm_scaled, rfm_df
 
 # --- MAIN ANALYSIS: CUSTOMER SEGMENTS ---
 def generate_segments(rfm_scaled, rfm_df, k):
@@ -93,7 +114,8 @@ def generate_segments(rfm_scaled, rfm_df, k):
 
     # Scatter plot
     fig_cluster, ax_cluster = plt.subplots(figsize=(12, 8))
-    sns.scatterplot(data=rfm_df, x='Recency', y='Frequency', hue='Cluster', palette='viridis', s=100, alpha=0.8, ax=ax_cluster)
+    sns.scatterplot(data=rfm_df, x='Recency', y='Frequency', hue='Cluster',
+                    palette='viridis', s=100, alpha=0.8, ax=ax_cluster)
     ax_cluster.set_title(f'Customer Segments based on Recency vs Frequency')
     ax_cluster.grid(True)
     plt.close(fig_cluster)
@@ -102,14 +124,14 @@ def generate_segments(rfm_scaled, rfm_df, k):
     cluster_summary = rfm_df.groupby('Cluster').agg({
         'Recency': 'mean', 'Frequency': 'mean', 'MonetaryValue': 'mean'
     }).round(1)
-    cluster_summary['Customer Count'] = rfm_df['Cluster'].value_counts()
+    cluster_summary['Customer Count'] = rfm_df.groupby('Cluster').size().values
     cluster_summary = cluster_summary.reset_index()
 
     return fig_cluster, cluster_summary
 
 # --- GRADIO UI ---
 with gr.Blocks(theme=gr.themes.Soft(), title="Interactive Customer Segmentation") as demo:
-    gr.Markdown("# Interactive Customer Segmentation App with KMeans")
+    gr.Markdown("# Interactive Customer Segmentation App with KMeans + EDA")
 
     df_state = gr.State()
     rfm_scaled_state = gr.State()
@@ -118,28 +140,30 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Interactive Customer Segmentation"
     with gr.Row():
         with gr.Column(scale=1):
             file_input = gr.File(label="Upload E-Commerce CSV")
-            load_button = gr.Button("Load Data & Show Elbow Plot", variant="primary")
+            load_button = gr.Button("Load Data & Run EDA", variant="primary")
             k_slider = gr.Slider(minimum=2, maximum=10, step=1, value=4, label="Adjust Number of Segments (K)")
             analyze_button = gr.Button("Generate Customer Segments", variant="primary")
 
         with gr.Column(scale=2):
             elbow_plot_output = gr.Plot(label="Optimal K (Elbow Method)")
+            hist_output = gr.Plot(label="RFM Histograms")
+            corr_output = gr.Plot(label="Correlation Heatmap")
             cluster_plot_output = gr.Plot(label="Customer Segments Plot")
             summary_output = gr.DataFrame(label="Segment Summary")
             status_textbox = gr.Textbox(label="Status", interactive=False)
 
     # --- FUNCTION WIRING ---
-    def load_and_show_elbow(file_obj):
+    def load_and_show_eda(file_obj):
         df, status, df_cleaned = load_initial_data(file_obj)
         if df is None:
-            return None, None, None, status
-        fig_elbow, rfm_scaled, rfm_df = compute_elbow(df_cleaned)
-        return df, fig_elbow, rfm_scaled, rfm_df, status
+            return None, None, None, None, None, status
+        fig_elbow, fig_hist, fig_corr, rfm_scaled, rfm_df = compute_elbow_and_eda(df_cleaned)
+        return df, fig_elbow, fig_hist, fig_corr, rfm_scaled, rfm_df, status
 
     load_button.click(
-        fn=load_and_show_elbow,
+        fn=load_and_show_eda,
         inputs=file_input,
-        outputs=[df_state, elbow_plot_output, rfm_scaled_state, rfm_df_state, status_textbox]
+        outputs=[df_state, elbow_plot_output, hist_output, corr_output, rfm_scaled_state, rfm_df_state, status_textbox]
     )
 
     analyze_button.click(
@@ -150,3 +174,4 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Interactive Customer Segmentation"
 
 if __name__ == "__main__":
     demo.launch()
+
